@@ -2,16 +2,16 @@
 
 A modular, vision-based mobile robot control framework developed by **PSA ROBUST**, Politeknik Sultan Salahuddin Abdul Aziz Shah (PSA), Malaysia. The project uses ROS 2 Humble, Python, OpenCV, a browser-based control panel, and a Teensy 4.1 microcontroller.
 
-**Current version:** V1.3  
-**Status:** Software integration and bidirectional USB serial communication validated  
+**Current version:** V1.4  
+**Status:** Software integration, bidirectional USB serial communication, FSM heartbeat and heartbeat timeout validated  
 **Development platform:** Ubuntu 22.04 / ROS 2 Humble  
-**Hardware control:** Teensy serial receiver tested; physical motor control not yet implemented
+**Hardware control:** Teensy serial receiver and heartbeat timeout tested; physical motor and LED control not yet implemented
 
 ## 1. Project Overview
 
 The framework separates camera acquisition, object detection, operational state management, motion-command generation, status reporting, web control, and serial communication into independent ROS 2 nodes.
 
-**Implemented in V1.3:**
+**Implemented through V1.4:**
 
 - USB camera image acquisition with OpenCV.
 - HSV-based blue ball detection with L/C/R/N classification and pixel-center coordinates.
@@ -20,8 +20,10 @@ The framework separates camera acquisition, object detection, operational state 
 - Zero-velocity commands when stopped, when detection is unavailable, or when coordinate data is stale.
 - Browser dashboard showing ball region, center coordinates, FSM state, and START/STOP buttons.
 - Bidirectional CSV communication between ROS 2 and Teensy 4.1 via USB serial.
+- **V1.4:** FSM heartbeat forwarded by `serial_node` to Teensy at 1 Hz, only when FSM status messages are recent.
+- **V1.4:** Teensy heartbeat timeout detection with fallback to `IDLE`; verified through live serial testing.
 
-**Not yet implemented:** YOLO inference, X-drive inverse kinematics, motor actuation, encoder feedback, physical odometry, or a hardware emergency-stop system.
+**Not yet implemented:** YOLO inference, X-drive inverse kinematics, motor actuation, encoder feedback, physical odometry, physical LED strip control, or a hardware emergency-stop system.
 
 ## 2. System Architecture
 
@@ -40,8 +42,9 @@ The framework separates camera acquisition, object detection, operational state 
   fsm_node <----------- START / STOP -------------+
      |                     (ROS 2 services)
      | /fsm/state ----------------> status_node
-     |                                |
-     |                           /robot/status
+     |       |                        |
+     |       |                   /robot/status
+     |       +----------------------> serial_node (heartbeat input)
      |
      | /fsm/ball_position (L/C/R/N)
      | /fsm/ball_center   (cx, cy)
@@ -50,16 +53,16 @@ The framework separates camera acquisition, object detection, operational state 
      | /cmd_vel (geometry_msgs/Twist)
      v
  serial_node <------ USB Serial RX ------> Teensy 4.1
-                 USB Serial TX
+                 USB Serial TX (velocity + FSM heartbeat)
 ```
 
 The **FSM controls permission to move**. The **robot controller computes motion commands**. The **serial node owns the hardware communication interface**; the robot controller does not open or configure a serial port.
 
-The Teensy firmware currently parses and echoes velocity commands. It **does not drive motors**.
+The Teensy firmware parses and echoes velocity commands, acknowledges FSM heartbeats, and detects heartbeat timeout. It **does not drive motors or physical LED outputs**.
 
 ## 3. ROS 2 Nodes
 
-| Node | Current V1.3 responsibility |
+| Node | Current V1.4 responsibility |
 |---|---|
 | `camera_node` | Captures frames from a USB camera and publishes images. |
 | `detector_node` | Detects a blue ball using HSV thresholding, classifies its image region as L/C/R/N, and publishes its pixel center when detected. |
@@ -67,7 +70,7 @@ The Teensy firmware currently parses and echoes velocity commands. It **does not
 | `robot_controller_node` | Uses valid ball coordinates to compute dynamic `vx` and `vy` using proportional control; publishes `/cmd_vel`. |
 | `status_node` | Republishes the latest FSM operational state as robot status. |
 | `web_node` | Hosts a local web dashboard, displays ball and FSM data, and invokes START/STOP services. |
-| `serial_node` | Converts `/cmd_vel` to CSV over USB serial and logs Teensy responses. |
+| `serial_node` | Converts `/cmd_vel` to CSV over USB serial, forwards fresh FSM status as a 1 Hz heartbeat, and logs Teensy responses. |
 
 **Total application nodes: 7.**
 
@@ -78,11 +81,11 @@ The Teensy firmware currently parses and echoes velocity commands. It **does not
 | `/camera/image_raw` | `sensor_msgs/msg/Image` | `camera_node` | `detector_node` | Camera frames |
 | `/detection` | `std_msgs/msg/String` | `detector_node` | `fsm_node`, `web_node` | `L`, `C`, `R`, or `N` |
 | `/ball/center` | `geometry_msgs/msg/Point` | `detector_node` | `fsm_node`, `web_node` | Detected center in pixel coordinates (`x=cx`, `y=cy`, `z=0`) |
-| `/fsm/state` | `std_msgs/msg/String` | `fsm_node` | `status_node`, `web_node` | `IDLE`, `RUNNING`, or `STOPPED` |
+| `/fsm/state` | `std_msgs/msg/String` | `fsm_node` | `status_node`, `web_node`, `serial_node` | `IDLE`, `RUNNING`, or `STOPPED` |
 | `/fsm/ball_position` | `std_msgs/msg/String` | `fsm_node` | `robot_controller_node` | Permitted L/C/R/N classification; `N` when movement is not permitted |
 | `/fsm/ball_center` | `geometry_msgs/msg/Point` | `fsm_node` | `robot_controller_node` | Valid ball center forwarded during RUNNING |
 | `/cmd_vel` | `geometry_msgs/msg/Twist` | `robot_controller_node` | `serial_node` | Body-frame velocity commands |
-| `/robot/status` | `std_msgs/msg/String` | `status_node` | None in V1.3 | Published operational status |
+| `/robot/status` | `std_msgs/msg/String` | `status_node` | None in V1.4 | Published operational status |
 
 **Total application topics: 8.** Standard ROS 2 system topics (for example `/rosout`) are not included in this count.
 
@@ -187,7 +190,7 @@ This software behavior is **not a safety-rated emergency stop**. The current ser
 
 ## 7. Teensy 4.1 Serial Communication
 
-The `serial_node` subscribes to `/cmd_vel`, serializes its values, and reads the Teensy receiver's response. Port and baud configuration are isolated from the robot controller.
+The `serial_node` subscribes to `/cmd_vel` and `/fsm/state`, serializes velocity commands, transmits FSM heartbeat messages, and reads the Teensy receiver's response. Port and baud configuration are isolated from the robot controller.
 
 | Parameter | Current configuration |
 |---|---|
@@ -195,7 +198,10 @@ The `serial_node` subscribes to `/cmd_vel`, serializes its values, and reads the
 | Serial device used in testing | `/dev/ttyACM0` |
 | Baud rate | 115200 |
 | Protocol | UTF-8 CSV, newline-terminated |
-| ROS 2 TX format | `vx,vy,wz\n` |
+| ROS 2 velocity TX format | `vx,vy,wz\n` |
+| ROS 2 heartbeat TX format | `HB,<STATE>\n` |
+| Teensy heartbeat acknowledgement | `HB_RX,<STATE>` |
+| Teensy heartbeat timeout notification | `HB_TIMEOUT,IDLE` |
 | Teensy RX acknowledgment/debug line | `RX \| vx=... \| vy=... \| wz=...` |
 | Hardware/simulation selection | `simulation` parameter of `serial_node` |
 | Current launch configuration | Hardware mode (`simulation: False`) |
@@ -212,7 +218,7 @@ Example response logged by `serial_node`:
 TEENSY RX: RX | vx=0.150 | vy=-0.150 | wz=0.000
 ```
 
-The Teensy firmware accepts three finite numeric values, echoes their parsed values, and **does not drive motor outputs**. Do not open Arduino Serial Monitor on the same port while `serial_node` owns it.
+The Teensy firmware accepts three finite numeric velocity values, echoes their parsed values, and handles FSM heartbeat messages. It **does not drive motor or LED outputs**. Do not open Arduino Serial Monitor on the same port while `serial_node` owns it.
 
 **Port note:** `/dev/ttyACM0` can change after reconnecting or uploading firmware. Verify the port before using hardware mode.
 
@@ -221,6 +227,50 @@ Firmware sketch:
 ```text
 firmware/teensy/psarobust_teensy_serial/psarobust_teensy_serial.ino
 ```
+
+### 7.1 FSM heartbeat and timeout (V1.4)
+
+No additional ROS 2 node or application topic is required. The existing `serial_node` directly subscribes to `/fsm/state`, while retaining `/cmd_vel` communication unchanged.
+
+| Item | Implemented behavior |
+|---|---|
+| FSM state source | `/fsm/state` (`std_msgs/msg/String`, published at 10 Hz by `fsm_node`) |
+| Valid states | `IDLE`, `STOPPED`, `RUNNING` |
+| ROS 2 heartbeat interval | 1 s (1 Hz) |
+| FSM freshness limit in `serial_node` | 1.5 s since the last valid state message; stale/missing state suppresses further heartbeat transmissions |
+| Teensy heartbeat timeout | 3000 ms since the last received heartbeat |
+| Timeout action | Set Teensy firmware's FSM state to `IDLE` and report `HB_TIMEOUT,IDLE` |
+| Heartbeat mechanism | USB serial message; **not** an additional ROS 2 topic |
+
+Serial protocol examples:
+
+```text
+ROS 2 -> Teensy: HB,IDLE
+Teensy -> ROS 2: HB_RX,IDLE
+ROS 2 -> Teensy: HB,RUNNING
+Teensy -> ROS 2: HB_RX,RUNNING
+ROS 2 -> Teensy: HB,STOPPED
+Teensy -> ROS 2: HB_RX,STOPPED
+[No heartbeat for > 3000 ms]
+Teensy -> ROS 2: HB_TIMEOUT,IDLE
+```
+
+**Verification completed:** All three FSM heartbeat states were acknowledged by Teensy 4.1. The timeout was confirmed by stopping only `fsm_node` while keeping `serial_node` active, allowing `TEENSY RX: HB_TIMEOUT,IDLE` to be observed in the ROS 2 terminal. Stopping the entire launch also stops the serial reader, so a later one-shot timeout message may not be visible in that terminal.
+
+**Scope limitation:** The timeout currently updates Teensy's stored FSM state; it is **not** a motor shutdown mechanism or a safety-rated watchdog. Motor actuation and physical LED hardware remain unimplemented.
+
+### 7.2 Planned physical LED status (not implemented)
+
+When an LED strip is installed, the intended Teensy-controlled indications are:
+
+| Condition | Planned LED behavior |
+|---|---|
+| `IDLE` or startup | Red breathing |
+| `STOPPED` | Steady red |
+| `RUNNING` | Steady white |
+| ROS 2/FSM heartbeat lost (timeout) | Red breathing |
+
+No LED output pin, strip driver, wiring, or LED animation has been implemented or tested in V1.4.
 
 ## 8. Installation and Usage
 
@@ -281,7 +331,7 @@ The current launch file starts seven nodes. Ensure that the USB camera and confi
 http://localhost:8080
 ```
 
-The browser UI displays the detected L/C/R/N region, ball-center pixels, and FSM state, and provides START/STOP buttons. It does not stream camera video in V1.3.
+The browser UI displays the detected L/C/R/N region, ball-center pixels, and FSM state, and provides START/STOP buttons. It does not stream camera video in V1.4.
 
 **Network caution:** The HTTP server listens on port 8080 without authentication or TLS in the current version. Use it only in a trusted development environment; do not expose it to the public internet.
 
@@ -304,6 +354,8 @@ Roadmap versions are **proposed targets**; future implementations may be resched
 |---|---|---|
 | V1.2 | Seven-node ROS 2 framework, web control, fixed L/C/R velocity mapping, bidirectional Teensy serial validation | Completed |
 | **V1.3** | **Dynamic coordinate-based `vx`/`vy` proportional control, FSM coordinate forwarding and stale-data handling** | **Completed (software/serial testing)** |
+| **V1.4** | **FSM heartbeat via USB serial, Teensy acknowledgement, and 3 s heartbeat timeout with IDLE fallback** | **Completed (hardware serial testing)** |
+| Future | Physical LED strip indicators controlled by Teensy | Pending hardware |
 | Future | YOLO-based detection and/or object tracking | Planned |
 | Future | X-drive inverse kinematics and four-wheel velocity generation | Planned |
 | Future | Motor driver and encoder integration | Planned |
@@ -324,7 +376,7 @@ Roadmap versions are **proposed targets**; future implementations may be resched
 | `web_node` | Video preview, telemetry, manual motion controls and access control |
 | `serial_node` | Command timeout handling, robust reconnection, protocol validation and hardware feedback |
 
-### 9.2 Possible additional nodes (not part of V1.3)
+### 9.2 Possible additional nodes (not part of V1.4)
 
 | Proposed node | Possible role |
 |---|---|
