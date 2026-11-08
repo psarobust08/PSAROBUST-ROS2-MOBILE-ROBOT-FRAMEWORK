@@ -1,6 +1,11 @@
+
+    
+  
 import rclpy
 from rclpy.node import Node
 from geometry_msgs.msg import Twist
+from std_msgs.msg import String
+import time
 
 
 class SerialNode(Node):
@@ -25,6 +30,8 @@ class SerialNode(Node):
         ).value
 
         self.serial_connection = None
+        self.fsm_state = None
+        self.last_fsm_time = None
 
         if not self.simulation:
             import serial
@@ -41,6 +48,16 @@ class SerialNode(Node):
             self.cmd_vel_callback,
             10
         )
+
+        self.create_subscription(
+            String,
+            '/fsm/state',
+            self.fsm_state_callback,
+            10
+        )
+
+        # Send FSM status as heartbeat once per second.
+        self.create_timer(1.0, self.heartbeat_callback)
 
         # Monitor incoming Teensy responses
         if not self.simulation:
@@ -73,6 +90,26 @@ class SerialNode(Node):
                 self.get_logger().error(
                     f'Serial write failed: {error}'
                 )
+
+    def fsm_state_callback(self, msg):
+        if msg.data in ('IDLE', 'STOPPED', 'RUNNING'):
+            self.fsm_state = msg.data
+            self.last_fsm_time = time.monotonic()
+
+    def heartbeat_callback(self):
+        # Do not send heartbeat if FSM stopped publishing.
+        if (self.last_fsm_time is None or
+                time.monotonic() - self.last_fsm_time > 1.5):
+            return
+
+        data = f'HB,{self.fsm_state}\n'
+        if self.simulation:
+            self.get_logger().info(f'SERIAL TX: {data.strip()}')
+        else:
+            try:
+                self.serial_connection.write(data.encode('utf-8'))
+            except Exception as error:
+                self.get_logger().error(f'Heartbeat write failed: {error}')
 
     def read_serial_callback(self):
         if self.serial_connection is None:
@@ -123,3 +160,4 @@ def main(args=None):
 
 if __name__ == '__main__':
     main()
+
